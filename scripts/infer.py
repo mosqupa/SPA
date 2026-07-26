@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import logging
+from utils import set_seed
 
+logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] - (%(name)s): %(message)s")
+logger = logging.getLogger(__name__)
 
 def run_hf(args: argparse.Namespace) -> None:
     """HuggingFace LlavaForConditionalGeneration backend."""
@@ -65,26 +69,42 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--num-beams", type=int, default=1)
+    parser.add_argument(
+        "--output-attention",
+        action="store_true",
+        help="Export all native LLaVA generation attention tensors.",
+    )
+    parser.add_argument(
+        "--attention-output-dir",
+        default="outputs/attention",
+        help="Directory for the raw generation_attentions.pt artifact.",
+    )
+    parser.add_argument("--keep-ratio", type=float, default=1.0)
 
     # Common
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
 
     # Model path: resolve backend-specific default after parsing
     args, unknown = parser.parse_known_args()
 
     # Set backend-specific defaults
     if args.backend == "hf":
+        logger.info("Using HuggingFace backend!")
         parser.set_defaults(model_path="models/llava-1.5-7b-hf")
         # HF needs a different prompt format
         if args.prompt == parser.get_default("prompt"):
             parser.set_defaults(prompt="USER: <image>\nWhat is in this image?\nASSISTANT:")
     else:
+        logger.info("Using native backend!")
         parser.set_defaults(model_path="models/llava-v1.5-7b")
         parser.set_defaults(load_in_4bit=True)
 
     parser.add_argument("--model-path", default=None)
 
     args = parser.parse_args()
+    set_seed(args.seed)
+
     # Resolve model_path default
     if args.model_path is None:
         args.model_path = "models/llava-v1.5-7b" if args.backend == "native" else "models/llava-1.5-7b-hf"

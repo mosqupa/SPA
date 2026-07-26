@@ -9,4 +9,9 @@ export HF_HUB_OFFLINE=1
 
 BACKEND="${BACKEND:-native}"
 
-python scripts/infer.py --backend "$BACKEND" "$@"
+python scripts/infer.py \
+    --output-attention \
+    --backend "$BACKEND" \
+    --max-new-tokens 16 \
+    --keep-ratio 1.0 \
+    "$@"

@@ -11,10 +11,11 @@ venv/
 models/
 LLaVA/playground/
 data/
-/images/
+images/
 outputs
-test.py
+tests/
 
 .DS_Store
 .idea/
 .vscode/
+*.yml

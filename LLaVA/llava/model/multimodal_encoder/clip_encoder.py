@@ -19,15 +19,15 @@ class CLIPVisionTower(nn.Module):
         elif getattr(args, 'unfreeze_mm_vision_tower', False):
             self.load_model()
         else:
-            self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
+            self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name, local_files_only=True)
 
     def load_model(self, device_map=None):
         if self.is_loaded:
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
             return
 
-        self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name, local_files_only=True)
+        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map, local_files_only=True)
         self.vision_tower.requires_grad_(False)
 
         self.is_loaded = True

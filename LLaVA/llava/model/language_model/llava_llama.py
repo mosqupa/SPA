@@ -26,6 +26,24 @@ from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+
+def _patched_forward(self, x, seq_len=None):
+    """Return a RoPE cache covering the model's full configured context."""
+    cache_len = max(seq_len or 0, self.max_position_embeddings)
+    if cache_len > self.max_seq_len_cached:
+        self._set_cos_sin_cache(seq_len=cache_len, device=x.device, dtype=x.dtype)
+
+    return (
+        self.cos_cached[:cache_len].to(dtype=x.dtype),
+        self.sin_cached[:cache_len].to(dtype=x.dtype),
+    )
+
+if not getattr(LlamaRotaryEmbedding, "_llava_gap_patched", False):
+    LlamaRotaryEmbedding._llava_original_forward = LlamaRotaryEmbedding.forward
+    LlamaRotaryEmbedding.forward = _patched_forward
+    LlamaRotaryEmbedding._llava_gap_patched = True
+
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
@@ -111,6 +129,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
+        keep_ratio = kwargs.pop("keep_ratio", 1.0)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
@@ -129,16 +148,27 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 None,
                 None,
                 images,
-                image_sizes=image_sizes
+                image_sizes=image_sizes,
+                keep_ratio=keep_ratio,
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
+
+        # Retain the fixed prompt coordinate system for optional attention
+        # export. Keeping CPU copies avoids holding extra GPU memory.
+        self._last_generation_prompt_position_ids = (
+            position_ids.detach().cpu() if position_ids is not None else None
+        )
+        self._last_generation_prompt_attention_mask = (
+            attention_mask.detach().cpu() if attention_mask is not None else None
+        )
+
         return super().generate(
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            **kwargs
+            position_ids=position_ids, # [batch, seq_len]
+            attention_mask=attention_mask, # None
+            inputs_embeds=inputs_embeds, # [batch, seq_len, embed_dim]
+            **kwargs # ['do_sample', 'temperature', 'top_p', 'num_beams', 'max_new_tokens', 'use_cache']
         )
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
@@ -148,6 +178,45 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
+        print("-----------------------------------------------------------------")
+        print("[after_super_prepare_func]: inputs_keys:", inputs.keys())
+        print("[after_super_prepare_func]: position_ids:", inputs['position_ids'].shape)
+        print("[after_super_prepare_func]: attention_mask:", inputs['attention_mask'].shape)
+        print("[after_super_prepare_func]: past_key_values: ", inputs['past_key_values'][0][0].shape if inputs['past_key_values'] is not None else None)
+        if 'inputs_embeds' in inputs:
+            print("[after_super_prepare_func]: inputs_embeds:", inputs['inputs_embeds'].shape if inputs['inputs_embeds'] is not None else None)
+        if 'input_ids' in inputs:
+            print("[after_super_prepare_func]: input_ids:", inputs['input_ids'].shape if inputs['input_ids'] is not None else None)
+        if past_key_values is not None:
+            full_position_ids = kwargs.get("position_ids") # get the full position_ids from kwargs [batch, 220]
+            if full_position_ids is not None:
+                decode_input_ids = inputs.get("input_ids")
+                decode_len = decode_input_ids.shape[-1]
+                prompt_len = full_position_ids.shape[-1]
+                attention_mask = inputs.get("attention_mask")
+
+                if attention_mask is not None and attention_mask.shape[-1] >= prompt_len:
+                    prompt_mask = attention_mask[:, :prompt_len].to(device=full_position_ids.device, dtype=torch.bool)
+                    prompt_indices = torch.arange(prompt_len, device=full_position_ids.device,).unsqueeze(0).expand_as(prompt_mask)
+                    last_prompt_indices = prompt_indices.masked_fill(~prompt_mask, -1).amax(dim=-1, keepdim=True).clamp_min(0)
+                    last_prompt_position = full_position_ids.gather(1, last_prompt_indices)
+                    generated_count = attention_mask.shape[-1] - prompt_len
+                else:
+                    last_prompt_position = full_position_ids[:, -1:]
+                    if hasattr(past_key_values, "get_seq_length"):
+                        past_length = past_key_values.get_seq_length()
+                    else:
+                        past_length = past_key_values[0][0].shape[-2]
+                    generated_count = past_length - prompt_len + decode_len
+
+                first_offset = generated_count - decode_len + 1
+                decode_offsets = torch.arange(
+                    first_offset,
+                    generated_count + 1,
+                    dtype=full_position_ids.dtype,
+                    device=full_position_ids.device,
+                ).unsqueeze(0)
+                inputs["position_ids"] = last_prompt_position + decode_offsets
         if images is not None:
             inputs['images'] = images
         if image_sizes is not None:

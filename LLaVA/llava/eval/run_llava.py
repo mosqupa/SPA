@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 import torch
 
 from llava.constants import (
@@ -23,6 +24,40 @@ import requests
 from PIL import Image
 from io import BytesIO
 import re
+
+
+def save_generation_attentions(generation_output, model, output_dir):
+    """Persist raw generation attentions"""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "generation_attentions.pt"
+
+    attentions = generation_output.attentions
+    tensor_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for step_attentions in attentions
+        for tensor in step_attentions
+    )
+    torch.save(
+        {
+            "format_version": 1,
+            "attention_axes": ["batch_or_beam", "head", "query", "key"],
+            "attentions": attentions,
+            "prompt_position_ids": getattr(
+                model, "_last_generation_prompt_position_ids", None
+            ),
+            "prompt_attention_mask": getattr(
+                model, "_last_generation_prompt_attention_mask", None
+            ),
+            "sequence_ids": generation_output.sequences.detach().cpu(),
+        },
+        output_file,
+    )
+    print(
+        f"Raw attentions saved to: {output_file.resolve()} "
+        f"({tensor_bytes / 1024 ** 3:.2f} GiB of tensor data)"
+    )
+    return output_file
 
 
 def image_parser(args):
@@ -114,8 +149,9 @@ def eval_model(args):
         .cuda()
     )
 
+    output_attention = getattr(args, "output_attention", False)
     with torch.inference_mode():
-        output_ids = model.generate(
+        generation_output = model.generate(
             input_ids,
             images=images_tensor,
             image_sizes=image_sizes,
@@ -125,7 +161,20 @@ def eval_model(args):
             num_beams=args.num_beams,
             max_new_tokens=args.max_new_tokens,
             use_cache=True,
+            keep_ratio=getattr(args, "keep_ratio", 1.0),
+            output_attentions=output_attention,
+            return_dict_in_generate=output_attention,
         )
+
+    if output_attention:
+        output_ids = generation_output.sequences
+        save_generation_attentions(
+            generation_output,
+            model,
+            getattr(args, "attention_output_dir", "outputs/attention"),
+        )
+    else:
+        output_ids = generation_output
 
     outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
     print(outputs)
@@ -144,6 +193,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--load-4bit", action="store_true")
+    parser.add_argument("--output-attention", action="store_true")
+    parser.add_argument("--attention-output-dir", default="outputs/attention")
+    parser.add_argument("--keep-ratio", type=float, default=1.0)
     args = parser.parse_args()
 
     eval_model(args)
