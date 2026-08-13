@@ -47,7 +47,7 @@ def run_native(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run LLaVA inference on a single image.")
-    parser.add_argument("--image", default="images/1.png", help="Path to input image")
+    parser.add_argument("--image", default="images/1.jpg", help="Path to input image")
     parser.add_argument("--prompt", default="What is in this image?", help="Text prompt")
 
     # Backend selection
@@ -84,6 +84,8 @@ def main() -> None:
     # Common
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use-2d-pe", action="store_true", help="Use 2D positional embeddings for images.")
+    parser.add_argument("--pe-scale", type=float, default=1.0, help="Scale for 2D positional embeddings.")
 
     # Model path: resolve backend-specific default after parsing
     args, unknown = parser.parse_known_args()
@@ -98,7 +100,7 @@ def main() -> None:
     else:
         logger.info("Using native backend!")
         parser.set_defaults(model_path="models/llava-v1.5-7b")
-        parser.set_defaults(load_in_4bit=True)
+        # parser.set_defaults(load_in_4bit=True)
 
     parser.add_argument("--model-path", default=None)
 

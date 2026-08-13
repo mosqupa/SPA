@@ -24,6 +24,7 @@ from .multimodal_projector.builder import build_vision_projector
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
+from llava.model.pos_embed import get_2d_sincos_pos_embed
 
 import logging
 logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] - (%(name)s): %(message)s")
@@ -141,14 +142,60 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
+    def encode_images(self, images, use_2d_pe=False, pe_scale=1.0, shuffle_pe=False, use_noise=False):
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
+
+        # Expose norms for the evaluation harness (per-call stats).
+        # Frobenius norm of the projected visual features (before any PE).
+        self._last_image_feature_norm = float(image_features.detach().norm().item())
+        self._last_pos_embed_norm = None
+        self._last_image_feature_norm_after_pe = self._last_image_feature_norm
+
+        if use_2d_pe:
+            grid_size = self.get_vision_tower().num_patches_per_side
+            embed_dim = image_features.shape[-1]
+            pos_embed = get_2d_sincos_pos_embed(embed_dim, grid_size).to(image_features.device, dtype=image_features.dtype)
+            pos_embed = pos_embed - pos_embed.mean(dim=0, keepdim=True)  # Center the positional embeddings
+
+            if shuffle_pe and use_noise:
+                raise ValueError(f"Shuffle_pe and Noise can not be used at the same time!")
+
+            # shuffle 2d positional embeddings with a fixed random seed for reproducibility
+            if shuffle_pe:
+                g = torch.Generator(device=pos_embed.device).manual_seed(42)
+                perm = torch.randperm(pos_embed.shape[0], device=pos_embed.device, generator=g)
+                shuffled_pos_embed = pos_embed[perm]
+                shuffled_pos_embed = shuffled_pos_embed * pe_scale
+                image_features = image_features + shuffled_pos_embed.unsqueeze(0)
+
+                self._last_pos_embed_norm = float(shuffled_pos_embed.detach().norm().item())
+                self._last_image_feature_norm_after_pe = float(image_features.detach().norm().item())
+                return image_features
+
+            elif use_noise:
+                g = torch.Generator(device=pos_embed.device).manual_seed(42)
+                noise = torch.randn(pos_embed.shape, device=pos_embed.device, dtype=pos_embed.dtype, generator=g)
+                noise = noise - noise.mean(dim=0, keepdim=True)
+                noise = noise / noise.norm(dim=-1, keepdim=True)
+                noise = noise * pos_embed.norm(dim=-1, keepdim=True)
+                noise = noise * pe_scale
+                image_features = image_features + noise.unsqueeze(0)
+
+                self._last_pos_embed_norm = float(noise.detach().norm().item())
+                self._last_image_feature_norm_after_pe = float(image_features.detach().norm().item())
+                return image_features
+
+            pos_embed = pos_embed * pe_scale
+            image_features = image_features + pos_embed.unsqueeze(0)
+
+            self._last_pos_embed_norm = float(pos_embed.detach().norm().item())
+            self._last_image_feature_norm_after_pe = float(image_features.detach().norm().item())
         return image_features
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None, keep_ratio=1.0
+        images, image_sizes=None, keep_ratio=1.0, use_2d_pe=False, pe_scale=1.0, shuffle_pe=False, use_noise=False
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -158,7 +205,7 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+            image_features = self.encode_images(concat_images, use_2d_pe=use_2d_pe, pe_scale=pe_scale, shuffle_pe=shuffle_pe, use_noise=use_noise)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -203,7 +250,7 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            image_features = self.encode_images(images, use_2d_pe=use_2d_pe, pe_scale=pe_scale, shuffle_pe=shuffle_pe, use_noise=use_noise)
             # logger.debug("image_features.shape: %s", image_features.shape)
 
         # TODO: image start / end is not implemented here to support pretraining.
@@ -228,12 +275,8 @@ class LlavaMetaForCausalLM(ABC):
 
         # remove the padding using attention_mask -- FIXME
         _input_ids = input_ids
-        logger.debug("input_ids.shape: %s", input_ids.shape)
-        logger.debug("labels.shape: %s", labels.shape)
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
-        logger.debug("input_ids (after removing padding) shape: %s", [x.shape for x in input_ids])
-        logger.debug("labels (after removing padding) shape: %s", [x.shape for x in labels])
 
         new_input_embeds = []
         new_labels = []
@@ -256,19 +299,15 @@ class LlavaMetaForCausalLM(ABC):
                 continue
 
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-            logger.debug("image_token_indices: %s", image_token_indices)
             cur_input_ids_noim = []
             cur_labels = labels[batch_idx]
             cur_labels_noim = []
             for i in range(len(image_token_indices) - 1):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            logger.debug("cur_input_ids_noim: %s", [x.shape for x in cur_input_ids_noim])
-            logger.debug("cur_labels_noim: %s", [x.shape for x in cur_labels_noim])
             split_sizes = [x.shape[0] for x in cur_labels_noim]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
-            logger.debug("cur_input_embeds_no_im: %s", [x.shape for x in cur_input_embeds_no_im])
             cur_new_input_embeds = []
             cur_new_labels = []
             cur_new_position_ids = []
@@ -290,13 +329,12 @@ class LlavaMetaForCausalLM(ABC):
                     cur_image_idx += 1
 
                     # random visual token pruning
-                    logger.debug("cur_image_features.shape (before pruning): %s", cur_image_features.shape)
                     num_visual_tokens = cur_image_features.shape[0]
                     num_keep = max(1, int(num_visual_tokens * keep_ratio))
-                    keep_indices = torch.randperm(num_visual_tokens, device=cur_image_features.device)[:num_keep]
+                    g = torch.Generator(device=cur_image_features.device).manual_seed(42 + cur_image_idx)
+                    keep_indices = torch.randperm(num_visual_tokens, device=cur_image_features.device, generator=g)[:num_keep]
                     keep_indices = keep_indices.sort().values
                     cur_image_features = cur_image_features[keep_indices]
-                    logger.debug("cur_image_features.shape (after pruning): %s", cur_image_features.shape)
 
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
@@ -314,8 +352,6 @@ class LlavaMetaForCausalLM(ABC):
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
             cur_new_position_ids = torch.cat(cur_new_position_ids)
-            logger.debug("cur_new_input_embeds.shape: %s", cur_new_input_embeds.shape)
-            logger.debug("cur_new_labels.shape: %s", cur_new_labels.shape)
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)

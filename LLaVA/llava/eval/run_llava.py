@@ -30,7 +30,10 @@ def save_generation_attentions(generation_output, model, output_dir):
     """Persist raw generation attentions"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / "generation_attentions.pt"
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"generation_attentions_{timestamp}.pt"
 
     attentions = generation_output.attentions
     tensor_bytes = sum(
@@ -164,6 +167,8 @@ def eval_model(args):
             keep_ratio=getattr(args, "keep_ratio", 1.0),
             output_attentions=output_attention,
             return_dict_in_generate=output_attention,
+            use_2d_pe=getattr(args, "use_2d_pe", False),
+            pe_scale=getattr(args, "pe_scale", 1.0),
         )
 
     if output_attention:

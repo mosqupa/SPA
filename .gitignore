@@ -19,3 +19,4 @@ tests/
 .idea/
 .vscode/
 *.yml
+*.txt

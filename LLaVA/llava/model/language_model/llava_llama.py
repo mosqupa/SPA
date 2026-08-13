@@ -130,6 +130,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
         keep_ratio = kwargs.pop("keep_ratio", 1.0)
+        use_2d_pe = kwargs.pop("use_2d_pe", False)
+        pe_scale = kwargs.pop("pe_scale", 1.0)
+        shuffle_pe = kwargs.pop("shuffle_pe", False)
+        use_noise = kwargs.pop("use_noise", False)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
@@ -150,6 +154,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 image_sizes=image_sizes,
                 keep_ratio=keep_ratio,
+                use_2d_pe=use_2d_pe,
+                pe_scale=pe_scale,
+                shuffle_pe=shuffle_pe,
+                use_noise=use_noise
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
@@ -178,17 +186,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
-        print("-----------------------------------------------------------------")
-        print("[after_super_prepare_func]: inputs_keys:", inputs.keys())
-        print("[after_super_prepare_func]: position_ids:", inputs['position_ids'].shape)
-        print("[after_super_prepare_func]: attention_mask:", inputs['attention_mask'].shape)
-        print("[after_super_prepare_func]: past_key_values: ", inputs['past_key_values'][0][0].shape if inputs['past_key_values'] is not None else None)
-        if 'inputs_embeds' in inputs:
-            print("[after_super_prepare_func]: inputs_embeds:", inputs['inputs_embeds'].shape if inputs['inputs_embeds'] is not None else None)
-        if 'input_ids' in inputs:
-            print("[after_super_prepare_func]: input_ids:", inputs['input_ids'].shape if inputs['input_ids'] is not None else None)
         if past_key_values is not None:
-            full_position_ids = kwargs.get("position_ids") # get the full position_ids from kwargs [batch, 220]
+            full_position_ids = kwargs.get("position_ids") # get the full position_ids from kwargs [batch, seq_len]
             if full_position_ids is not None:
                 decode_input_ids = inputs.get("input_ids")
                 decode_len = decode_input_ids.shape[-1]
