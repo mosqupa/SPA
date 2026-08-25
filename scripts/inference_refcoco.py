@@ -54,7 +54,10 @@ def main():
     parser.add_argument("--model-path", default="models/llava-v1.5-7b")
     parser.add_argument("--model-base", default=None)
     parser.add_argument("--split", default="refcoco_val_questions",
-                        choices=["refcoco_val_questions", "refcoco_test_questions", "refcoco_testB_questions"])
+                        choices=["refcoco_val_questions", "refcoco_test_questions", "refcoco_testB_questions",
+                                 "refcoco_plus_val_questions", "refcoco_plus_test_questions",
+                                 "refcoco_plus_testB_questions",
+                                 "refcocog_val_questions", "refcocog_test_questions"])
     parser.add_argument("--data-dir", default="data/refcoco")
     parser.add_argument("--conv-mode", default="vicuna_v1")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -66,6 +69,14 @@ def main():
     parser.add_argument("--pe-scale", type=float, default=1.0, help="Scale for 2D positional embeddings.")
     parser.add_argument("--shuffle-pe", action="store_true", help="Shuffle 2D positional embeddings for images.")
     parser.add_argument("--use-noise", action="store_true", help="Use noise for ablation")
+    parser.add_argument("--use-pos-adapter", action="store_true",
+                        help="Add the learnable PositionAdapter delta to visual features.")
+    parser.add_argument("--adapter-path", default="outputs/pos_adapter.pt",
+                        help="Path to a trained PositionAdapter state_dict to load (default: randomly-initialised adapter).")
+    parser.add_argument("--adapter-type", default="fourier", choices=["fourier", "raw"],
+                        help="PositionAdapter variant to build (must match the checkpoint's training variant).")
+    parser.add_argument("--shuffle-coords", action="store_true",
+                        help="Feed the adapter a fixed permutation of the patch coordinates.")
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -74,17 +85,25 @@ def main():
     data_dir = project_root / args.data_dir
     question_file = data_dir / "converted" / f"{args.split}.jsonl"
     image_dir = data_dir / "images"
-    pe_tag = f"2dpe_{args.pe_scale}" if args.use_2d_pe else "no2dpe"
-    if args.shuffle_pe:
-        answer_dir = data_dir / "answers" / args.split / args.model_name / f"{args.pruning_method}_{args.keep_ratio}_{pe_tag}_shuffle"
-    elif args.use_noise:
-        answer_dir = data_dir / "answers" / args.split / args.model_name / f"{args.pruning_method}_{args.keep_ratio}_{pe_tag}_noise"
+    if args.use_pos_adapter:
+        pe_tag = f"_adapter_pe{args.pe_scale}"
+        if args.adapter_type == "raw":
+            pe_tag = pe_tag.replace("_adapter_pe", "_adapter_raw_pe")
+    elif args.use_2d_pe:
+        pe_tag = f"_2dpe_{args.pe_scale}"
     else:
-        answer_dir = data_dir / "answers" / args.split / args.model_name / f"{args.pruning_method}_{args.keep_ratio}_{pe_tag}"
+        pe_tag = ""
+    suffix = ""
+    if args.shuffle_pe or args.shuffle_coords:
+        suffix = "_shuffle"
+    elif args.use_noise:
+        suffix = "_noise"
+    answer_dir = data_dir / "answers" / args.split / args.model_name / f"{args.pruning_method}_{args.keep_ratio}{pe_tag}{suffix}"
     answer_dir.mkdir(parents=True, exist_ok=True)
     answer_file = answer_dir / "merge.jsonl"
     metrics_file = answer_dir / "metrics.txt"
-
+    print("output directory:", answer_dir)
+    
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     import random
@@ -112,6 +131,17 @@ def main():
 
     if 'plain' in model_name and 'finetune' not in model_name.lower() and 'mmtag' not in args.conv_mode:
         args.conv_mode = args.conv_mode + '_mmtag'
+
+    # Load (or lazily create) the position adapter
+    if args.use_pos_adapter:
+        # ensure_position_adapter() reads config.pos_adapter_type to pick the variant
+        model.config.pos_adapter_type = args.adapter_type
+        adapter = model.get_model().ensure_position_adapter()
+        if args.adapter_path:
+            adapter.load_state_dict(torch.load(args.adapter_path, map_location="cpu"))
+            print(f"Loaded PositionAdapter from: {args.adapter_path}")
+        else:
+            print("WARNING: no --adapter-path given; using randomly-initialised adapter.")
 
     # Inference — one question at a time
     results = []
@@ -145,7 +175,9 @@ def main():
                     use_2d_pe=args.use_2d_pe,
                     pe_scale=args.pe_scale,
                     shuffle_pe=args.shuffle_pe,
-                    use_noise=args.use_noise
+                    use_noise=args.use_noise,
+                    use_pos_adapter=args.use_pos_adapter,
+                    shuffle_coords=args.shuffle_coords
                 )
 
             text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()

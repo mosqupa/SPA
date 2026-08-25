@@ -1,14 +1,14 @@
 #!/bin/bash
-# POPE hallucination sweep: keep_ratio x {no adapter, adapter} x subset, one job per GPU.
+# TextVQA val sweep: keep_ratio x {no adapter, adapter}, one job per GPU.
 #
 # Usage:
-#   bash scripts/eval_pope.sh                               # uses the CONFIG block below
-#   CUDA_VISIBLE_DEVICES=0,1 bash scripts/eval_pope.sh      # restrict GPUs
-#   KEEP_RATIOS="0.5 0.25" POPE_SUBSETS="random popular" bash scripts/eval_pope.sh
+#   bash scripts/eval_textvqa.sh                            # uses the CONFIG block below
+#   CUDA_VISIBLE_DEVICES=0,1 bash scripts/eval_textvqa.sh   # restrict GPUs
+#   KEEP_RATIOS="1.0 0.5 0.25" bash scripts/eval_textvqa.sh
 #
-# Each combo runs scripts/pope_inference.py with an explicit env. Results land
-# in data/pope/answers/<model>/<subset>/random_<kr>[_adapter]/; per-job logs in
-# LOG_DIR; a summary matrix per subset is printed at the end.
+# Each combo runs scripts/textvqa_inference.py with an explicit env. Results
+# land in data/textvqa/answers/<model>/random_<kr>[_adapter]/; per-job logs in
+# LOG_DIR; a summary matrix is printed at the end.
 
 # NOTE: not `set -e` — one failed combo must not abort the rest of the sweep.
 set -uo pipefail
@@ -22,18 +22,16 @@ export HF_HUB_OFFLINE=1
 : "${KEEP_RATIOS:=0.5 0.25}"         # space-separated keep ratios
 : "${USE_ADAPTER:=no adapter}" # space-separated adapter variants (no / adapter)
 : "${ADAPTER_PATH:=outputs/pos_adapter.pt}"
-: "${POPE_SUBSETS:=random adversarial popular}"   # space-separated POPE subsets
 : "${MODEL_NAME:=llava-v1.5-7b}"
 : "${PRUNING_METHOD:=random}"
 : "${CONDA_PYTHON:=/opt/conda/envs/vlm/bin/python}"
 : "${SKIP_EXISTING:=0}"              # skip combos whose metrics.txt exists
-: "${LOG_DIR:=$PROJECT_ROOT/outputs/pope_logs}"
+: "${LOG_DIR:=$PROJECT_ROOT/outputs/textvqa_logs}"
 # ================================================================
 
 mkdir -p "$LOG_DIR"
 read -ra KEEP_RATIOS <<< "$KEEP_RATIOS"
 read -ra ADAPTERS <<< "$USE_ADAPTER"
-read -ra SUBSETS <<< "$POPE_SUBSETS"
 
 # GPU list: explicit CUDA_VISIBLE_DEVICES wins; otherwise auto-detect all GPUs
 if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
@@ -44,35 +42,32 @@ else
 fi
 N_GPUS=${#GPULIST[@]}
 
-# Build task list: one entry per (subset, keep_ratio, adapter) combo
+# Build task list: one entry per (keep_ratio, adapter) combo
 TASKS=()
-for sub in "${SUBSETS[@]}"; do
-    for kr in "${KEEP_RATIOS[@]}"; do
-        for a in "${ADAPTERS[@]}"; do
-            TASKS+=("$sub $kr $a")
-        done
+for kr in "${KEEP_RATIOS[@]}"; do
+    for a in "${ADAPTERS[@]}"; do
+        TASKS+=("$kr $a")
     done
 done
 N_TASKS=${#TASKS[@]}
 
 echo "=============================================="
-echo "  POPE sweep"
-echo "  subsets:    ${SUBSETS[*]}"
+echo "  TextVQA val sweep"
 echo "  keep_ratio: ${KEEP_RATIOS[*]}"
 echo "  variants:   ${ADAPTERS[*]} ($ADAPTER_PATH)"
 echo "  combos:     $N_TASKS"
 echo "  GPUs:       ${GPULIST[*]}"
 echo "=============================================="
 
-run_task() { # $1 = subset, $2 = keep_ratio, $3 = variant (no|adapter)
-    local sub=$1 kr=$2 v=$3
+run_task() { # $1 = keep_ratio, $2 = variant (no|adapter)
+    local kr=$1 v=$2
     local tag="${PRUNING_METHOD}_${kr}"
     [ "$v" = "adapter" ] && tag="${tag}_adapter"
-    local out_dir="$PROJECT_ROOT/data/pope/answers/$MODEL_NAME/$sub/$tag"
-    local log_file="$LOG_DIR/${sub}_keep${kr}_${v}.log"
+    local out_dir="$PROJECT_ROOT/data/textvqa/answers/$MODEL_NAME/$tag"
+    local log_file="$LOG_DIR/keep${kr}_${v}.log"
 
     if [ "$SKIP_EXISTING" = "1" ] && [ -f "$out_dir/metrics.txt" ]; then
-        echo "[skip] $sub/$tag"
+        echo "[skip] $tag"
         return 0
     fi
 
@@ -80,8 +75,7 @@ run_task() { # $1 = subset, $2 = keep_ratio, $3 = variant (no|adapter)
     if [ "$v" = "adapter" ]; then
         ADAPTER_ARGS="--use-pos-adapter --adapter-path $ADAPTER_PATH"
     fi
-    "$CONDA_PYTHON" "$PROJECT_ROOT/scripts/inference_pope.py" \
-        --subset "$sub" \
+    "$CONDA_PYTHON" "$PROJECT_ROOT/scripts/inference_textvqa.py" \
         --model-name "$MODEL_NAME" \
         --keep-ratio "$kr" \
         --pruning-method "$PRUNING_METHOD" \
@@ -89,10 +83,10 @@ run_task() { # $1 = subset, $2 = keep_ratio, $3 = variant (no|adapter)
     local py_pid=$!
     echo "$py_pid" >> "$PY_PID_FILE"
     if ! wait "$py_pid"; then
-        echo "[FAIL] $sub/$tag  (log: $log_file)"
+        echo "[FAIL] $tag  (log: $log_file)"
         return 1
     fi
-    echo "[ ok ] $sub/$tag"
+    echo "[ ok ] $tag"
 }
 
 FAILED_FILE="$LOG_DIR/.failed"
@@ -120,10 +114,10 @@ worker() { # $1 = GPU slot index
     local slot=$1 gpu=${GPULIST[$slot]}
     local i
     for ((i = slot; i < N_TASKS; i += N_GPUS)); do
-        read -r sub kr v <<< "${TASKS[$i]}"
-        echo "[gpu $gpu] subset=$sub keep=$kr variant=$v"
-        if ! CUDA_VISIBLE_DEVICES="$gpu" run_task "$sub" "$kr" "$v"; then
-            echo "$sub ${PRUNING_METHOD}_${kr}_${v}" >> "$FAILED_FILE"
+        read -r kr v <<< "${TASKS[$i]}"
+        echo "[gpu $gpu] keep=$kr variant=$v"
+        if ! CUDA_VISIBLE_DEVICES="$gpu" run_task "$kr" "$v"; then
+            echo "${PRUNING_METHOD}_${kr}_${v}" >> "$FAILED_FILE"
         fi
     done
 }
@@ -138,9 +132,9 @@ if [ -s "$FAILED_FILE" ]; then
     echo "Failed combos: $(tr '\n' ' ' < "$FAILED_FILE")"
 fi
 
-# --- Summary matrix (per subset) ---
+# --- Summary matrix ---
 KEEP_RATIOS_STR="${KEEP_RATIOS[*]}" USE_ADAPTER_STR="${ADAPTERS[*]}" \
-SUBSETS_STR="${SUBSETS[*]}" MODEL_NAME="$MODEL_NAME" PRUNING_METHOD="$PRUNING_METHOD" \
+MODEL_NAME="$MODEL_NAME" PRUNING_METHOD="$PRUNING_METHOD" \
 LOG_DIR="$LOG_DIR" PROJECT_ROOT="$PROJECT_ROOT" python3 - <<'PYEOF'
 import os
 from pathlib import Path
@@ -150,46 +144,38 @@ model = os.environ["MODEL_NAME"]
 method = os.environ["PRUNING_METHOD"]
 keep_ratios = os.environ["KEEP_RATIOS_STR"].split()
 variants = os.environ["USE_ADAPTER_STR"].split()
-subsets = os.environ["SUBSETS_STR"].split()
 
-def load_score(sub, kr, tag):
-    metrics = root / "data/pope/answers" / model / sub / f"{method}_{kr}{tag}" / "metrics.txt"
+def load_score(kr, tag):
+    metrics = root / "data/textvqa/answers" / model / f"{method}_{kr}{tag}" / "metrics.txt"
     if not metrics.is_file():
         return None
     for line in metrics.read_text().splitlines():
-        if line.strip().startswith("F1:"):
+        if line.strip().startswith("Accuracy:"):
             return float(line.split(":")[1].strip().rstrip("%"))
     return None
 
+print(f"\n{'='*60}\nSummary [TextVQA val] — accuracy (%)\n{'='*60}")
+header = "keep_ratio\\variant" + "".join(f"{v:>14}" for v in variants)
+print(header)
 rows = []
-for sub in subsets:
-    print(f"\n{'='*60}\nSummary [{sub}] — F1 (%) and accuracy (%)\n{'='*60}")
-    header = "keep_ratio\\variant " + "".join(f"{v:>14}" for v in variants)
-    print(header)
-    for kr in keep_ratios:
-        cells_f1, cells_acc = [], []
-        for v in variants:
-            tag = "" if v == "no" else "_adapter"
-            metrics = root / "data/pope/answers" / model / sub / f"{method}_{kr}{tag}" / "metrics.txt"
-            f1 = acc = None
-            if metrics.is_file():
-                for line in metrics.read_text().splitlines():
-                    if line.strip().startswith("F1:"):
-                        f1 = float(line.split(":")[1].strip().rstrip("%"))
-                    elif line.strip().startswith("Accuracy:"):
-                        acc = float(line.split(":")[1].strip().rstrip("%"))
-            cells_f1.append("" if f1 is None else f"{f1:14.2f}")
-            cells_acc.append("" if acc is None else f"{acc:14.2f}")
-            rows.append([sub, kr, v, f1, acc])
-        print(f"{float(kr):>12} " + "".join(cells_f1) + "    (F1)")
-        print(f"{'':>12} " + "".join(cells_acc) + "    (acc)")
+for kr in keep_ratios:
+    cells = []
+    for v in variants:
+        tag = "" if v == "no" else "_adapter"
+        s = load_score(kr, tag)
+        cells.append("" if s is None else f"{s:14.2f}")
+        rows.append([kr, v, s])
+    print(f"{float(kr):>12} " + "".join(cells))
 
-csv_path = Path(os.environ["LOG_DIR"]) / "summary_pope.csv"
+csv_path = Path(os.environ["LOG_DIR"]) / "summary_textvqa.csv"
 with open(csv_path, "w") as f:
-    f.write("subset,keep_ratio,variant,f1,acc\n")
-    for sub, kr, v, f1, acc in rows:
-        f.write(f"{sub},{kr},{v},{f1 if f1 is not None else ''},{acc if acc is not None else ''}\n")
+    f.write("keep_ratio,variant,acc\n")
+    for kr, v, s in rows:
+        f.write(f"{kr},{v},{s if s is not None else ''}\n")
 print(f"\nCSV saved: {csv_path}")
+missing = [r for r in rows if r[2] is None]
+if missing:
+    print(f"WARNING: {len(missing)} combo(s) missing — rerun the sweep to fill gaps (SKIP_EXISTING skips done ones)")
 PYEOF
 
 echo "Done. Logs: $LOG_DIR"

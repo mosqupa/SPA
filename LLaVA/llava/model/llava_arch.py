@@ -25,6 +25,7 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 
 from llava.mm_utils import get_anyres_image_grid_shape
 from llava.model.pos_embed import get_2d_sincos_pos_embed
+from llava.model.pos_adapter import PositionAdapter, PositionAdapterRawCoords
 
 import logging
 logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] - (%(name)s): %(message)s")
@@ -44,6 +45,36 @@ class LlavaMetaModel:
                 self.image_newline = nn.Parameter(
                     torch.empty(config.hidden_size, dtype=self.dtype)
                 )
+
+        self.position_adapter = None
+
+    def ensure_position_adapter(self):
+        """Lazily build the learnable position adapter (frozen CLIP + projector + LLM).
+
+        The adapter is kept in float32 master weights (only ~1.1M params):
+        AdamW creates its exp_avg/exp_avg_sq state in the parameter's dtype,
+        and fp16 state underflows to 0.0 for the small gradients seen early
+        in training, making the update explode to +-inf (eps=1e-8 only in the
+        denominator). The fp32 delta is cast to fp16 in encode_images when
+        added to the visual features.
+        """
+        if self.position_adapter is None:
+            # config.pos_adapter_type selects the ablation variant:
+            #   "fourier" (default) — MLP over log-spaced Fourier features
+            #   "raw"              — MLP over raw (x, y) coordinates
+            cls = PositionAdapterRawCoords \
+                if getattr(self.config, "pos_adapter_type", "fourier") == "raw" \
+                else PositionAdapter
+            adapter = cls(embed_dim=self.config.hidden_size)
+            # Move to device only — dtype stays fp32 (see docstring above)
+            ref = next(self.mm_projector.parameters())
+            adapter.to(device=ref.device)
+            self.position_adapter = adapter
+            logger.info(
+                "PositionAdapter created: %d trainable params",
+                sum(p.numel() for p in adapter.parameters()),
+            )
+        return self.position_adapter
 
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
@@ -142,7 +173,7 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images, use_2d_pe=False, pe_scale=1.0, shuffle_pe=False, use_noise=False):
+    def encode_images(self, images, use_2d_pe=False, pe_scale=1.0, shuffle_pe=False, use_noise=False, use_pos_adapter=False, shuffle_coords=False):
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
 
@@ -191,11 +222,26 @@ class LlavaMetaForCausalLM(ABC):
 
             self._last_pos_embed_norm = float(pos_embed.detach().norm().item())
             self._last_image_feature_norm_after_pe = float(image_features.detach().norm().item())
+            
+        elif use_pos_adapter:
+            adapter = self.get_model().ensure_position_adapter()
+            grid_size = self.get_vision_tower().num_patches_per_side
+            coords = PositionAdapter.make_coords(grid_size, device=image_features.device)
+            if shuffle_coords:
+                g = torch.Generator(device=coords.device).manual_seed(42)
+                perm = torch.randperm(coords.shape[0], device=coords.device, generator=g)
+                coords = coords[perm]
+            delta = adapter(coords).to(device=image_features.device, dtype=image_features.dtype)  # [L, embed_dim]
+            image_features = image_features + delta.unsqueeze(0) * pe_scale
+
+            self._last_pos_embed_norm = float(delta.detach().norm().item())
+            self._last_image_feature_norm_after_pe = float(image_features.detach().norm().item())
         return image_features
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None, keep_ratio=1.0, use_2d_pe=False, pe_scale=1.0, shuffle_pe=False, use_noise=False
+        images, image_sizes=None, keep_ratio=1.0, use_2d_pe=False, pe_scale=1.0, shuffle_pe=False, use_noise=False,
+        use_pos_adapter=False, shuffle_coords=False,
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -205,7 +251,7 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images, use_2d_pe=use_2d_pe, pe_scale=pe_scale, shuffle_pe=shuffle_pe, use_noise=use_noise)
+            image_features = self.encode_images(concat_images, use_2d_pe=use_2d_pe, pe_scale=pe_scale, shuffle_pe=shuffle_pe, use_noise=use_noise, use_pos_adapter=use_pos_adapter, shuffle_coords=shuffle_coords)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -250,7 +296,7 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images, use_2d_pe=use_2d_pe, pe_scale=pe_scale, shuffle_pe=shuffle_pe, use_noise=use_noise)
+            image_features = self.encode_images(images, use_2d_pe=use_2d_pe, pe_scale=pe_scale, shuffle_pe=shuffle_pe, use_noise=use_noise, use_pos_adapter=use_pos_adapter, shuffle_coords=shuffle_coords)
             # logger.debug("image_features.shape: %s", image_features.shape)
 
         # TODO: image start / end is not implemented here to support pretraining.

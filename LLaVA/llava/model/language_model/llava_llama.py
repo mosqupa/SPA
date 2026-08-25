@@ -85,6 +85,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
+        use_pos_adapter: bool = False,
+        shuffle_coords: bool = False,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
@@ -103,7 +105,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values,
                 labels,
                 images,
-                image_sizes
+                image_sizes,
+                use_pos_adapter=use_pos_adapter,
+                shuffle_coords=shuffle_coords
             )
 
         return super().forward(
@@ -134,6 +138,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         pe_scale = kwargs.pop("pe_scale", 1.0)
         shuffle_pe = kwargs.pop("shuffle_pe", False)
         use_noise = kwargs.pop("use_noise", False)
+        use_pos_adapter = kwargs.pop("use_pos_adapter", False)
+        shuffle_coords = kwargs.pop("shuffle_coords", False)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
@@ -157,7 +163,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 use_2d_pe=use_2d_pe,
                 pe_scale=pe_scale,
                 shuffle_pe=shuffle_pe,
-                use_noise=use_noise
+                use_noise=use_noise,
+                use_pos_adapter=use_pos_adapter,
+                shuffle_coords=shuffle_coords
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)

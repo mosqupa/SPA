@@ -1,78 +1,182 @@
 #!/bin/bash
-# Official LLaVA v1.5 GQA evaluation pipeline.
+# GQA testdev_balanced sweep: keep_ratio x {no adapter, adapter}, one job per GPU.
 #
 # Usage:
-#   bash scripts/official_eval_gqa.sh                    # single GPU
-#   CUDA_VISIBLE_DEVICES=0,1 bash scripts/official_eval_gqa.sh  # multi-GPU
+#   bash scripts/eval_gqa.sh                               # uses the CONFIG block below
+#   CUDA_VISIBLE_DEVICES=0,1 bash scripts/eval_gqa.sh      # restrict GPUs
+#   KEEP_RATIOS="1.0 0.5 0.25" USE_ADAPTER=true bash scripts/eval_gqa.sh
 #
-# Data setup (one-time):
-#   python scripts/setup_official_gqa_pope.py
+# Each combo runs scripts/gqa_inference.py with an explicit env, so every
+# (keep_ratio x adapter) pair is a self-contained experiment. Results land in
+# data/gqa/answers/<model>/random_<kr>[_adapter]/; per-job logs in LOG_DIR; a
+# summary matrix is printed at the end.
 
-set -e
-export HF_HUB_OFFLINE=1
+# NOTE: not `set -e` — one failed combo must not abort the rest of the sweep.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-LLAVA_ROOT="$PROJECT_ROOT/LLaVA"
+cd "$PROJECT_ROOT"
+export HF_HUB_OFFLINE=1
 
-cd "$LLAVA_ROOT"
+# ============================ CONFIG ============================
+: "${KEEP_RATIOS:=0.5 0.25}"         # space-separated keep ratios
+: "${USE_ADAPTER:=no adapter}" # space-separated adapter variants (no / adapter)
+: "${ADAPTER_PATH:=outputs/pos_adapter.pt}"
+: "${MODEL_NAME:=llava-v1.5-7b}"
+: "${PRUNING_METHOD:=random}"
+: "${CONDA_PYTHON:=/opt/conda/envs/vlm/bin/python}"
+: "${SKIP_EXISTING:=0}"              # skip combos whose metrics.txt exists
+: "${LOG_DIR:=$PROJECT_ROOT/outputs/gqa_logs}"
+# ================================================================
 
-# --- Config ---
-MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/models/llava-v1.5-7b}"
-MODEL_NAME="${MODEL_NAME:-llava-v1.5-7b}"
-LOAD_4BIT="${LOAD_4BIT:-1}"
-SPLIT="llava_gqa_testdev_balanced"
-GQADIR="./playground/data/eval/gqa/data"
+mkdir -p "$LOG_DIR"
+read -ra KEEP_RATIOS <<< "$KEEP_RATIOS"
 
-# Build optional flags
-FOURBIT_FLAG=""
-if [ "$LOAD_4BIT" = "1" ]; then
-    FOURBIT_FLAG="--load-4bit"
+# GPU list: explicit CUDA_VISIBLE_DEVICES wins; otherwise auto-detect all GPUs
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -ra GPULIST <<< "$CUDA_VISIBLE_DEVICES"
+else
+    mapfile -t GPULIST < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
+    [ ${#GPULIST[@]} -gt 0 ] || GPULIST=(0)   # fallback: no nvidia-smi → assume GPU 0
 fi
+N_GPUS=${#GPULIST[@]}
 
-# --- Multi-GPU ---
-gpu_list="${CUDA_VISIBLE_DEVICES:-0}"
-IFS=',' read -ra GPULIST <<< "$gpu_list"
-CHUNKS=${#GPULIST[@]}
+# Build task list: one entry per (keep_ratio, adapter) combo
+read -ra ADAPTERS <<< "$USE_ADAPTER"
+TASKS=()
+for kr in "${KEEP_RATIOS[@]}"; do
+    for a in "${ADAPTERS[@]}"; do
+        TASKS+=("$kr $a")
+    done
+done
+N_TASKS=${#TASKS[@]}
 
-echo "========================================="
-echo "  GQA Evaluation"
-echo "  Model:  $MODEL_PATH"
-echo "  GPUs:   $gpu_list ($CHUNKS chunks)"
-echo "========================================="
+echo "=============================================="
+echo "  GQA testdev_balanced sweep"
+echo "  keep_ratio: ${KEEP_RATIOS[*]}"
+echo "  variants:   ${ADAPTERS[*]} ($ADAPTER_PATH)"
+echo "  combos:     $N_TASKS"
+echo "  GPUs:       ${GPULIST[*]}"
+echo "=============================================="
 
-# Step 1 — Inference
-echo "[1/3] Running inference..."
-for IDX in $(seq 0 $((CHUNKS - 1))); do
-    CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m llava.eval.model_vqa_loader \
-        --model-path "$MODEL_PATH" \
-        --question-file "./playground/data/eval/gqa/$SPLIT.jsonl" \
-        --image-folder "./playground/data/eval/gqa/data/images" \
-        --answers-file "./playground/data/eval/gqa/answers/$SPLIT/$MODEL_NAME/${CHUNKS}_${IDX}.jsonl" \
-        --num-chunks "$CHUNKS" \
-        --chunk-idx "$IDX" \
-        --temperature 0 \
-        --conv-mode vicuna_v1 \
-        $FOURBIT_FLAG &
+run_task() { # $1 = keep_ratio, $2 = variant (no|adapter)
+    local kr=$1 v=$2
+    local tag="${PRUNING_METHOD}_${kr}"
+    [ "$v" = "adapter" ] && tag="${tag}_adapter"
+    local out_dir="$PROJECT_ROOT/data/gqa/answers/$MODEL_NAME/$tag"
+    local log_file="$LOG_DIR/keep${kr}_${v}.log"
+
+    if [ "$SKIP_EXISTING" = "1" ] && [ -f "$out_dir/metrics.txt" ]; then
+        echo "[skip] $tag"
+        return 0
+    fi
+
+    local ADAPTER_ARGS=""
+    if [ "$v" = "adapter" ]; then
+        ADAPTER_ARGS="--use-pos-adapter --adapter-path $ADAPTER_PATH"
+    fi
+    "$CONDA_PYTHON" "$PROJECT_ROOT/scripts/inference_gqa.py" \
+        --model-name "$MODEL_NAME" \
+        --keep-ratio "$kr" \
+        --pruning-method "$PRUNING_METHOD" \
+        $ADAPTER_ARGS > "$log_file" 2>&1 &
+    local py_pid=$!
+    echo "$py_pid" >> "$PY_PID_FILE"
+    if ! wait "$py_pid"; then
+        echo "[FAIL] $tag  (log: $log_file)"
+        return 1
+    fi
+    echo "[ ok ] $tag"
+}
+
+FAILED_FILE="$LOG_DIR/.failed"
+: > "$FAILED_FILE"
+
+# Track python PIDs so Ctrl+C can kill the whole tree (workers alone would
+# leave orphaned python processes running the current combo).
+PY_PID_FILE="$LOG_DIR/.pids"
+: > "$PY_PID_FILE"
+WORKER_PIDS=()
+
+_CLEANUP_DONE=0
+cleanup() {
+    [ "$_CLEANUP_DONE" = "1" ] && exit 130
+    _CLEANUP_DONE=1
+    echo "Interrupted — killing workers..."
+    [ ${#WORKER_PIDS[@]} -gt 0 ] && kill "${WORKER_PIDS[@]}" 2>/dev/null
+    [ -s "$PY_PID_FILE" ] && xargs -r kill < "$PY_PID_FILE" 2>/dev/null
+    wait 2>/dev/null
+    exit 130
+}
+trap cleanup INT TERM
+
+worker() { # $1 = GPU slot index
+    local slot=$1 gpu=${GPULIST[$slot]}
+    local i
+    for ((i = slot; i < N_TASKS; i += N_GPUS)); do
+        read -r kr v <<< "${TASKS[$i]}"
+        echo "[gpu $gpu] keep=$kr variant=$v"
+        if ! CUDA_VISIBLE_DEVICES="$gpu" run_task "$kr" "$v"; then
+            echo "${PRUNING_METHOD}_${kr}_${v}" >> "$FAILED_FILE"
+        fi
+    done
+}
+
+for slot in $(seq 0 $((N_GPUS - 1))); do
+    ( worker "$slot" || true ) &
+    WORKER_PIDS+=($!)
 done
 wait
-echo "[1/3] Inference done."
 
-# Step 2 — Merge chunks
-echo "[2/3] Merging chunks..."
-ANSWER_DIR="./playground/data/eval/gqa/answers/$SPLIT/$MODEL_NAME"
-output_file="$ANSWER_DIR/merge.jsonl"
-> "$output_file"
-for IDX in $(seq 0 $((CHUNKS - 1))); do
-    cat "$ANSWER_DIR/${CHUNKS}_${IDX}.jsonl" >> "$output_file"
-done
-echo "[2/3] Merged → $output_file ($(wc -l < "$output_file") lines)"
+if [ -s "$FAILED_FILE" ]; then
+    echo "Failed combos: $(tr '\n' ' ' < "$FAILED_FILE")"
+fi
 
-# Step 3 — Convert + Evaluate
-echo "[3/3] Converting & scoring..."
-python scripts/convert_gqa_for_eval.py \
-    --src "$output_file" \
-    --dst "$GQADIR/testdev_balanced_predictions.json"
+# --- Summary matrix ---
+KEEP_RATIOS_STR="${KEEP_RATIOS[*]}" USE_ADAPTER_STR="${ADAPTERS[*]}" \
+MODEL_NAME="$MODEL_NAME" PRUNING_METHOD="$PRUNING_METHOD" \
+LOG_DIR="$LOG_DIR" PROJECT_ROOT="$PROJECT_ROOT" python3 - <<'PYEOF'
+import os
+from pathlib import Path
 
-cd "$GQADIR"
-python eval/eval.py --tier testdev_balanced
+root = Path(os.environ["PROJECT_ROOT"])
+model = os.environ["MODEL_NAME"]
+method = os.environ["PRUNING_METHOD"]
+keep_ratios = os.environ["KEEP_RATIOS_STR"].split()
+variants = os.environ["USE_ADAPTER_STR"].split()
+
+def load_score(kr, tag):
+    metrics = root / "data/gqa/answers" / model / f"{method}_{kr}{tag}" / "metrics.txt"
+    if not metrics.is_file():
+        return None
+    for line in metrics.read_text().splitlines():
+        if line.strip().startswith("Overall accuracy:"):
+            return float(line.split(":")[1].strip().rstrip("%"))
+    return None
+
+print(f"\n{'='*60}\nSummary [GQA testdev_balanced] — overall accuracy (%)\n{'='*60}")
+header = "keep_ratio\\variant" + "".join(f"{v:>14}" for v in variants)
+print(header)
+rows = []
+for kr in keep_ratios:
+    cells = []
+    for v in variants:
+        tag = "" if v == "no" else "_adapter"
+        s = load_score(kr, tag)
+        cells.append("" if s is None else f"{s:14.2f}")
+        rows.append([kr, v, s])
+    print(f"{float(kr):>12} " + "".join(cells))
+
+csv_path = Path(os.environ["LOG_DIR"]) / "summary_gqa.csv"
+with open(csv_path, "w") as f:
+    f.write("keep_ratio,variant,overall_acc\n")
+    for kr, v, s in rows:
+        f.write(f"{kr},{v},{s if s is not None else ''}\n")
+print(f"\nCSV saved: {csv_path}")
+missing = [r for r in rows if r[2] is None]
+if missing:
+    print(f"WARNING: {len(missing)} combo(s) missing — rerun the sweep to fill gaps (SKIP_EXISTING skips done ones)")
+PYEOF
+
+echo "Done. Logs: $LOG_DIR"
